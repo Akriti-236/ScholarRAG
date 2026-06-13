@@ -8,7 +8,7 @@ DATA_PATH = "ingestion/papers.json"
 client = arxiv.Client()
 
 def fetch_field(category, limit):
-    print(f"➡️searching category: {category}")
+    print(f"Searching category: {category}")
 
     search = arxiv.Search(
         query=f"cat:{category}",
@@ -24,7 +24,9 @@ def fetch_field(category, limit):
 
     for result in results:
         papers.append({
+            "id": result.entry_id.split("/")[-1],
             "title": result.title,
+            "authors": [a.name for a in result.authors],
             "summary": result.summary,
             "published": str(result.published),
             "pdf_url": result.pdf_url,
