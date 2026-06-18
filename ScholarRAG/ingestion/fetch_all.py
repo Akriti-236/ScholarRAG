@@ -100,19 +100,23 @@ def reconstruct_abstract(inv: dict) -> str:
     return " ".join(w for _, w in pairs)
 
 
-def load_progress() -> set:
+def load_progress() -> tuple[set, list]:
     if PROGRESS_FILE.exists():
         try:
             with open(PROGRESS_FILE, encoding="utf-8") as f:
-                return set(json.load(f).get("done", []))
+                data = json.load(f)
+                return set(data.get("done", [])), data.get("oa_done_pairs", [])
         except Exception:
             pass
-    return set()
+    return set(), []
 
 
-def save_progress(done: set):
+def save_progress(done: set, oa_done_pairs: list | None = None):
+    data: dict = {"done": list(done)}
+    if oa_done_pairs is not None:
+        data["oa_done_pairs"] = oa_done_pairs
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"done": list(done)}, f)
+        json.dump(data, f)
 
 
 def load_fetch_papers() -> tuple[list, set]:
@@ -151,17 +155,17 @@ def save_fetch_papers(papers: list):
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 
-def fetch_pwc(seen_ids: set, hf_token: str, test: bool) -> list:
+def fetch_pwc(all_papers: list, seen_ids: set, hf_token: str, test: bool):
     try:
         from datasets import load_dataset
     except ImportError:
         print("ERROR: install `datasets` package")
-        return []
+        return
 
     print("\n[Phase 1] Streaming all PWC papers-with-abstracts ...")
-    papers  = []
-    skipped = 0
-    total   = 0
+    skipped   = 0
+    collected = 0
+    SAVE_EVERY = 50_000
 
     for item in load_dataset(PWC_ABSTRACTS_DS, split="train", streaming=True, token=hf_token):
         abstract = (item.get("abstract") or "").strip()
@@ -189,7 +193,7 @@ def fetch_pwc(seen_ids: set, hf_token: str, test: bool) -> list:
         published = str(raw_date.date()) if hasattr(raw_date, "date") else str(raw_date or "")
         year      = published[:4] if published else ""
 
-        papers.append({
+        all_papers.append({
             "id":              uid,
             "arxiv_id":        arxiv_id,
             "title":           item.get("title", ""),
@@ -210,28 +214,36 @@ def fetch_pwc(seen_ids: set, hf_token: str, test: bool) -> list:
             "language":        "en",
         })
 
-        total += 1
-        if total % 50_000 == 0:
-            print(f"  ... {total:,} collected", flush=True)
+        collected += 1
 
-        if test and total >= 500:
+        if collected % SAVE_EVERY == 0:
+            save_fetch_papers(all_papers)
+            print(f"  checkpoint — {collected:,} collected | saved {len(all_papers):,} total", flush=True)
+
+        if test and collected >= 500:
             break
 
-    print(f"  PWC done: {total:,} collected | {skipped:,} skipped\n")
-    return papers
+    save_fetch_papers(all_papers)
+    print(f"  PWC done: {collected:,} collected | {skipped:,} skipped\n")
 
 
 # ── Phase 2 ────────────────────────────────────────────────────────────────────
 
-def fetch_openalex(seen_ids: set, test: bool) -> list:
+def fetch_openalex(all_papers: list, seen_ids: set, oa_done_pairs: list, test: bool):
     print("[Phase 2] Fetching OpenAlex non-tech papers ...")
-    papers = []
-    years  = OA_YEARS[:2] if test else OA_YEARS
-    per_yr = 5 if test else OA_PER_YEAR
+    done_set   = set(oa_done_pairs)
+    years      = OA_YEARS[:2] if test else OA_YEARS
+    per_yr     = 5 if test else OA_PER_YEAR
+    collected  = 0
+    SAVE_EVERY = 1_000
 
     for field in OA_FIELDS:
         field_count = 0
         for year in years:
+            pair = f"{field}_{year}"
+            if pair in done_set:
+                continue
+
             try:
                 r = requests.get(
                     OA_BASE,
@@ -258,9 +270,9 @@ def fetch_openalex(seen_ids: set, test: bool) -> list:
                     if not abstract:
                         continue
 
-                    doi    = (w.get("doi") or "").replace("https://doi.org/", "").strip()
-                    oa_id  = w.get("id", "").split("/")[-1]
-                    uid    = doi or oa_id
+                    doi   = (w.get("doi") or "").replace("https://doi.org/", "").strip()
+                    oa_id = w.get("id", "").split("/")[-1]
+                    uid   = doi or oa_id
 
                     if not uid or uid in seen_ids:
                         continue
@@ -288,7 +300,7 @@ def fetch_openalex(seen_ids: set, test: bool) -> list:
                     ext_ids  = w.get("ids") or {}
                     arxiv_id = (ext_ids.get("arxiv") or "").replace("https://arxiv.org/abs/", "").strip()
 
-                    papers.append({
+                    all_papers.append({
                         "id":              uid,
                         "arxiv_id":        arxiv_id,
                         "title":           w.get("display_name", ""),
@@ -307,7 +319,15 @@ def fetch_openalex(seen_ids: set, test: bool) -> list:
                         "has_code":        False,
                         "language":        "en",
                     })
+                    collected  += 1
                     field_count += 1
+
+                done_set.add(pair)
+                oa_done_pairs.append(pair)
+
+                if collected % SAVE_EVERY == 0 and collected > 0:
+                    save_fetch_papers(all_papers)
+                    print(f"  checkpoint — {collected:,} OA collected | saved {len(all_papers):,} total", flush=True)
 
                 time.sleep(0.15)
 
@@ -316,8 +336,8 @@ def fetch_openalex(seen_ids: set, test: bool) -> list:
 
         print(f"  {field:<25} {field_count:>5} papers")
 
-    print(f"  OpenAlex done: {len(papers):,} papers\n")
-    return papers
+    save_fetch_papers(all_papers)
+    print(f"  OpenAlex done: {collected:,} papers\n")
 
 
 # ── Phase 3a ───────────────────────────────────────────────────────────────────
@@ -470,8 +490,8 @@ def enrich_citations_openalex(papers: list, test: bool):
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main(test: bool):
-    hf_token = os.getenv("HF_TOKEN", "")
-    done     = load_progress()
+    hf_token              = os.getenv("HF_TOKEN", "")
+    done, oa_done_pairs   = load_progress()
 
     all_papers, seen_ids = load_fetch_papers()
     print(f"Loaded {len(all_papers):,} existing papers from {FETCH_FILE}\n")
@@ -479,24 +499,20 @@ def main(test: bool):
     if not test and "pwc_abstracts" in done:
         print("[Phase 1] PWC abstracts — skipping (done)\n")
     else:
-        pwc_papers = fetch_pwc(seen_ids, hf_token, test)
-        all_papers.extend(pwc_papers)
-        save_fetch_papers(all_papers)
-        print(f"  Saved {len(all_papers):,} papers after PWC\n")
+        fetch_pwc(all_papers, seen_ids, hf_token, test)
         if not test:
             done.add("pwc_abstracts")
-            save_progress(done)
+            save_progress(done, oa_done_pairs)
+        print(f"  Total after PWC: {len(all_papers):,}\n")
 
     if not test and "openalex_papers" in done:
         print("[Phase 2] OpenAlex papers — skipping (done)\n")
     else:
-        oa_papers = fetch_openalex(seen_ids, test)
-        all_papers.extend(oa_papers)
-        save_fetch_papers(all_papers)
-        print(f"  Saved {len(all_papers):,} papers after OpenAlex\n")
+        fetch_openalex(all_papers, seen_ids, oa_done_pairs, test)
         if not test:
             done.add("openalex_papers")
-            save_progress(done)
+            save_progress(done, oa_done_pairs)
+        print(f"  Total after OpenAlex: {len(all_papers):,}\n")
 
     if not test and "github_enriched" in done:
         print("[Phase 3a] GitHub links — skipping (done)\n")
@@ -505,7 +521,7 @@ def main(test: bool):
         save_fetch_papers(all_papers)
         if not test:
             done.add("github_enriched")
-            save_progress(done)
+            save_progress(done, oa_done_pairs)
 
     if not test and "citations_enriched" in done:
         print("[Phase 3b] Citations — skipping (done)\n")
@@ -514,7 +530,7 @@ def main(test: bool):
         save_fetch_papers(all_papers)
         if not test:
             done.add("citations_enriched")
-            save_progress(done)
+            save_progress(done, oa_done_pairs)
 
     with open(ENRICHED_FILE, "w", encoding="utf-8") as f:
         json.dump(all_papers, f, indent=2, ensure_ascii=False)
