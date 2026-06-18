@@ -171,6 +171,10 @@ def fetch_pwc(hf_token: str, test: bool) -> list:
         except Exception:
             papers, seen = [], set()
 
+    if test and len(papers) >= 500:
+        tprint(f"[PWC] Test mode — returning {len(papers):,} existing papers")
+        return papers
+
     try:
         from datasets import load_dataset
     except ImportError:
@@ -265,6 +269,10 @@ def fetch_openalex(test: bool) -> list:
                 done_set = set(json.load(f).get("done_pairs", []))
         except Exception:
             done_set = set()
+
+    if test and len(papers) >= 60:
+        tprint(f"[OA] Test mode — returning {len(papers):,} existing papers")
+        return papers
 
     years  = OA_YEARS[:2] if test else OA_YEARS
     per_yr = 5 if test else OA_PER_YEAR
