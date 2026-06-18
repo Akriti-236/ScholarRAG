@@ -1,41 +1,50 @@
 import json
 import time
+import threading
 import requests
 import urllib3
 import argparse
-from pathlib import Path
-from dotenv import load_dotenv
 import os
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_base = Path(__file__).parent
+for _env in (_base / ".env", _base.parent / "backend" / ".env"):
+    if _env.exists():
+        load_dotenv(dotenv_path=_env)
+        break
 load_dotenv(dotenv_path=Path(__file__).parent.parent / "backend" / ".env")
 
-FETCH_FILE     = Path("ingestion/fetch_papers.json")
+PWC_FILE       = Path("ingestion/pwc_papers.json")
+OA_FILE        = Path("ingestion/oa_papers.json")
+OA_PROGRESS    = Path("ingestion/oa_progress.json")
+CIT_CACHE      = Path("ingestion/citations_cache.json")
 ENRICHED_FILE  = Path("ingestion/papers_enriched.json")
 PROGRESS_FILE  = Path("ingestion/fetch_progress.json")
 PWC_LINKS_FILE = Path("ingestion/pwc_links.json")
 
 PWC_ABSTRACTS_DS = "pwc-archive/papers-with-abstracts"
-
 OA_BASE    = "https://api.openalex.org/works"
 OA_HEADERS = {"User-Agent": "ScholarRAG/1.0 (mailto:24f3003029@ds.study.iitm.ac.in)"}
 
 OA_FIELDS = [
-    "Medicine",
-    "Biology",
-    "Astronomy",
-    "Chemistry",
-    "Environmental Science",
-    "Psychology",
-    "Economics",
-    "Physics",
-    "Political Science",
-    "History",
+    "Medicine", "Biology", "Astronomy", "Chemistry",
+    "Environmental Science", "Psychology", "Economics",
+    "Physics", "Political Science", "History",
 ]
-OA_YEARS    = list(range(2014, 2026))  # 12 years
+OA_YEARS    = list(range(2014, 2026))
 OA_PER_YEAR = 100
 
-CURRENT_YEAR = 2025
+_print_lock = threading.Lock()
+
+
+def tprint(*args, **kwargs):
+    with _print_lock:
+        print(*args, **kwargs)
+
 
 _AREA_KEYWORDS: list[tuple[str, list[str]]] = [
     ("vision",   ["image classification", "image generation", "image segmentation",
@@ -100,71 +109,48 @@ def reconstruct_abstract(inv: dict) -> str:
     return " ".join(w for _, w in pairs)
 
 
-def load_progress() -> tuple[set, list]:
+def load_progress() -> set:
     if PROGRESS_FILE.exists():
         try:
             with open(PROGRESS_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-                return set(data.get("done", [])), data.get("oa_done_pairs", [])
+                return set(json.load(f).get("done", []))
         except Exception:
             pass
-    return set(), []
+    return set()
 
 
-def save_progress(done: set, oa_done_pairs: list | None = None):
-    data: dict = {"done": list(done)}
-    if oa_done_pairs is not None:
-        data["oa_done_pairs"] = oa_done_pairs
+def save_progress(done: set):
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-
-
-def load_fetch_papers() -> tuple[list, set]:
-    if not FETCH_FILE.exists():
-        return [], set()
-    try:
-        import ijson
-        papers = []
-        seen   = set()
-        with open(FETCH_FILE, "rb") as f:
-            for p in ijson.items(f, "item"):
-                papers.append(p)
-                for k in ("arxiv_id", "doi", "id"):
-                    v = p.get(k, "")
-                    if v:
-                        seen.add(v)
-                        break
-        return papers, seen
-    except ImportError:
-        with open(FETCH_FILE, encoding="utf-8") as f:
-            papers = json.load(f)
-        seen = set()
-        for p in papers:
-            for k in ("arxiv_id", "doi", "id"):
-                v = p.get(k, "")
-                if v:
-                    seen.add(v)
-                    break
-        return papers, seen
-
-
-def save_fetch_papers(papers: list):
-    with open(FETCH_FILE, "w", encoding="utf-8") as f:
-        json.dump(papers, f, indent=2, ensure_ascii=False)
+        json.dump({"done": list(done)}, f)
 
 
 # ── Phase 1 ────────────────────────────────────────────────────────────────────
 
-def fetch_pwc(all_papers: list, seen_ids: set, hf_token: str, test: bool):
+def fetch_pwc(hf_token: str, test: bool) -> list:
+    papers: list = []
+    seen:   set  = set()
+
+    if PWC_FILE.exists():
+        try:
+            with open(PWC_FILE, encoding="utf-8") as f:
+                papers = json.load(f)
+            for p in papers:
+                uid = p.get("arxiv_id") or p.get("id")
+                if uid:
+                    seen.add(uid)
+            tprint(f"[PWC] Resuming from {len(papers):,} existing papers")
+        except Exception:
+            papers, seen = [], set()
+
     try:
         from datasets import load_dataset
     except ImportError:
-        print("ERROR: install `datasets` package")
-        return
+        tprint("[PWC] ERROR: install `datasets` package")
+        return papers
 
-    print("\n[Phase 1] Streaming all PWC papers-with-abstracts ...")
+    tprint("[PWC] Streaming papers-with-abstracts ...")
+    collected = len(papers)
     skipped   = 0
-    collected = 0
     SAVE_EVERY = 50_000
 
     for item in load_dataset(PWC_ABSTRACTS_DS, split="train", streaming=True, token=hf_token):
@@ -176,7 +162,7 @@ def fetch_pwc(all_papers: list, seen_ids: set, hf_token: str, test: bool):
         arxiv_id = (item.get("arxiv_id") or "").strip()
         uid      = arxiv_id or item.get("paper_url", "").split("/")[-1]
 
-        if not uid or uid in seen_ids:
+        if not uid or uid in seen:
             skipped += 1
             continue
 
@@ -185,15 +171,15 @@ def fetch_pwc(all_papers: list, seen_ids: set, hf_token: str, test: bool):
             skipped += 1
             continue
 
-        seen_ids.add(uid)
+        seen.add(uid)
         if arxiv_id:
-            seen_ids.add(arxiv_id)
+            seen.add(arxiv_id)
 
         raw_date  = item.get("date")
         published = str(raw_date.date()) if hasattr(raw_date, "date") else str(raw_date or "")
         year      = published[:4] if published else ""
 
-        all_papers.append({
+        papers.append({
             "id":              uid,
             "arxiv_id":        arxiv_id,
             "title":           item.get("title", ""),
@@ -211,30 +197,52 @@ def fetch_pwc(all_papers: list, seen_ids: set, hf_token: str, test: bool):
             "source":          "pwc",
             "github_repos":    [],
             "has_code":        False,
-            "language":        "en",
         })
-
         collected += 1
 
         if collected % SAVE_EVERY == 0:
-            save_fetch_papers(all_papers)
-            print(f"  checkpoint — {collected:,} collected | saved {len(all_papers):,} total", flush=True)
+            with open(PWC_FILE, "w", encoding="utf-8") as f:
+                json.dump(papers, f, ensure_ascii=False)
+            tprint(f"[PWC] checkpoint {collected:,} | skipped {skipped:,}", flush=True)
 
         if test and collected >= 500:
             break
 
-    save_fetch_papers(all_papers)
-    print(f"  PWC done: {collected:,} collected | {skipped:,} skipped\n")
+    with open(PWC_FILE, "w", encoding="utf-8") as f:
+        json.dump(papers, f, ensure_ascii=False)
+    tprint(f"[PWC] done — {collected:,} collected | {skipped:,} skipped")
+    return papers
 
 
 # ── Phase 2 ────────────────────────────────────────────────────────────────────
 
-def fetch_openalex(all_papers: list, seen_ids: set, oa_done_pairs: list, test: bool):
-    print("[Phase 2] Fetching OpenAlex non-tech papers ...")
-    done_set   = set(oa_done_pairs)
-    years      = OA_YEARS[:2] if test else OA_YEARS
-    per_yr     = 5 if test else OA_PER_YEAR
-    collected  = 0
+def fetch_openalex(test: bool) -> list:
+    papers:   list = []
+    seen:     set  = set()
+    done_set: set  = set()
+
+    if OA_FILE.exists():
+        try:
+            with open(OA_FILE, encoding="utf-8") as f:
+                papers = json.load(f)
+            for p in papers:
+                uid = p.get("doi") or p.get("id")
+                if uid:
+                    seen.add(uid)
+            tprint(f"[OA] Resuming from {len(papers):,} existing papers")
+        except Exception:
+            papers, seen = [], set()
+
+    if OA_PROGRESS.exists():
+        try:
+            with open(OA_PROGRESS, encoding="utf-8") as f:
+                done_set = set(json.load(f).get("done_pairs", []))
+        except Exception:
+            done_set = set()
+
+    years  = OA_YEARS[:2] if test else OA_YEARS
+    per_yr = 5 if test else OA_PER_YEAR
+    new    = 0
     SAVE_EVERY = 1_000
 
     for field in OA_FIELDS:
@@ -259,7 +267,7 @@ def fetch_openalex(all_papers: list, seen_ids: set, oa_done_pairs: list, test: b
                     timeout=30,
                 )
                 if r.status_code == 429:
-                    print(f"  Rate limited — sleeping 30s")
+                    tprint("[OA] rate limited — sleeping 30s")
                     time.sleep(30)
                     continue
                 if r.status_code != 200:
@@ -274,11 +282,11 @@ def fetch_openalex(all_papers: list, seen_ids: set, oa_done_pairs: list, test: b
                     oa_id = w.get("id", "").split("/")[-1]
                     uid   = doi or oa_id
 
-                    if not uid or uid in seen_ids:
+                    if not uid or uid in seen:
                         continue
-                    seen_ids.add(uid)
+                    seen.add(uid)
                     if doi:
-                        seen_ids.add(doi)
+                        seen.add(doi)
 
                     authors = [
                         (a.get("author") or {}).get("display_name", "")
@@ -300,7 +308,7 @@ def fetch_openalex(all_papers: list, seen_ids: set, oa_done_pairs: list, test: b
                     ext_ids  = w.get("ids") or {}
                     arxiv_id = (ext_ids.get("arxiv") or "").replace("https://arxiv.org/abs/", "").strip()
 
-                    all_papers.append({
+                    papers.append({
                         "id":              uid,
                         "arxiv_id":        arxiv_id,
                         "title":           w.get("display_name", ""),
@@ -317,55 +325,70 @@ def fetch_openalex(all_papers: list, seen_ids: set, oa_done_pairs: list, test: b
                         "source":          "openalex",
                         "github_repos":    [],
                         "has_code":        False,
-                        "language":        "en",
                     })
-                    collected  += 1
+                    new += 1
                     field_count += 1
 
                 done_set.add(pair)
-                oa_done_pairs.append(pair)
+                with open(OA_PROGRESS, "w", encoding="utf-8") as f:
+                    json.dump({"done_pairs": list(done_set)}, f)
 
-                if collected % SAVE_EVERY == 0 and collected > 0:
-                    save_fetch_papers(all_papers)
-                    print(f"  checkpoint — {collected:,} OA collected | saved {len(all_papers):,} total", flush=True)
+                if new % SAVE_EVERY == 0 and new > 0:
+                    with open(OA_FILE, "w", encoding="utf-8") as f:
+                        json.dump(papers, f, ensure_ascii=False)
+                    tprint(f"[OA] checkpoint {new:,} | {field} {year}", flush=True)
 
                 time.sleep(0.15)
 
             except Exception as e:
-                print(f"  Error {field} {year}: {e}")
+                tprint(f"[OA] error {field} {year}: {e}")
 
-        print(f"  {field:<25} {field_count:>5} papers")
+        tprint(f"[OA] {field:<25} {field_count:>5} papers")
 
-    save_fetch_papers(all_papers)
-    print(f"  OpenAlex done: {collected:,} papers\n")
+    with open(OA_FILE, "w", encoding="utf-8") as f:
+        json.dump(papers, f, ensure_ascii=False)
+    tprint(f"[OA] done — {new:,} new papers")
+    return papers
+
+
+# ── Merge ──────────────────────────────────────────────────────────────────────
+
+def merge_papers(pwc: list, oa: list) -> list:
+    seen:   set  = set()
+    merged: list = []
+    for p in pwc + oa:
+        uid = p.get("arxiv_id") or p.get("doi") or p.get("id")
+        if uid and uid in seen:
+            continue
+        if uid:
+            seen.add(uid)
+        merged.append(p)
+    tprint(f"[Merge] {len(pwc):,} PWC + {len(oa):,} OA → {len(merged):,} unique")
+    return merged
 
 
 # ── Phase 3a ───────────────────────────────────────────────────────────────────
 
 def enrich_github(papers: list, test: bool):
-    print("[Phase 3a] Loading GitHub links from pwc_links.json ...")
-
+    tprint("[GitHub] Loading pwc_links.json ...")
     if not PWC_LINKS_FILE.exists():
-        print(f"  WARNING: {PWC_LINKS_FILE} not found — skipping")
+        tprint(f"[GitHub] WARNING: {PWC_LINKS_FILE} not found — skipping")
         return
 
     with open(PWC_LINKS_FILE, encoding="utf-8") as f:
         pwc_links: dict = json.load(f)
 
-    print(f"  Loaded {len(pwc_links):,} entries")
-
-    arxiv_index: dict[str, int] = {}
-    for i, p in enumerate(papers):
-        aid = p.get("arxiv_id", "")
-        if aid:
-            arxiv_index[aid] = i
+    arxiv_index: dict[str, int] = {
+        p["arxiv_id"]: i
+        for i, p in enumerate(papers)
+        if p.get("arxiv_id")
+    }
 
     matched = 0
     for arxiv_id, repos in pwc_links.items():
         if arxiv_id not in arxiv_index:
             continue
-        idx = arxiv_index[arxiv_id]
-        p   = papers[idx]
+        p           = papers[arxiv_index[arxiv_id]]
         max_stars   = 0
         is_official = False
         for repo in repos:
@@ -386,31 +409,50 @@ def enrich_github(papers: list, test: bool):
             p["is_official"] = is_official
             matched += 1
 
-    print(f"  GitHub links matched: {matched:,} papers\n")
+    tprint(f"[GitHub] matched {matched:,} papers")
 
 
 # ── Phase 3b ───────────────────────────────────────────────────────────────────
 
-def enrich_citations_openalex(papers: list, test: bool):
-    print("[Phase 3b] Enriching citations via OpenAlex ...")
+def enrich_citations(papers: list, test: bool):
+    tprint("[Citations] Loading cache ...")
+    cache: dict = {}
+    if CIT_CACHE.exists():
+        try:
+            with open(CIT_CACHE, encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
 
-    doi_index   = {}
-    arxiv_index = {}
+    doi_index:   dict[str, dict] = {}
+    arxiv_index: dict[str, dict] = {}
 
     for p in papers:
         if p.get("source") == "openalex":
             continue
         doi      = (p.get("doi") or "").strip()
         arxiv_id = (p.get("arxiv_id") or "").strip()
-        if doi:
+
+        doi_key   = f"doi:{doi}"     if doi      else None
+        arxiv_key = f"arxiv:{arxiv_id}" if arxiv_id else None
+
+        if doi_key and doi_key in cache:
+            p["citations"] = cache[doi_key]
+        elif arxiv_key and arxiv_key in cache:
+            p["citations"] = cache[arxiv_key]
+        elif doi:
             doi_index[doi] = p
         elif arxiv_id:
             arxiv_index[arxiv_id] = p
 
-    print(f"  {len(doi_index):,} via DOI  |  {len(arxiv_index):,} via arxiv ID")
+    tprint(
+        f"[Citations] {len(cache):,} from cache | "
+        f"{len(doi_index):,} via DOI | {len(arxiv_index):,} via arxiv"
+    )
 
     enriched   = 0
     batch_size = 100
+    SAVE_EVERY = 5_000
 
     doi_list = list(doi_index.keys())
     if test:
@@ -437,14 +479,19 @@ def enrich_citations_openalex(papers: list, test: bool):
                     doi = (w.get("doi") or "").replace("https://doi.org/", "").strip()
                     p   = doi_index.get(doi)
                     if p:
-                        p["citations"] = w.get("cited_by_count", 0)
+                        count = w.get("cited_by_count", 0)
+                        p["citations"]     = count
+                        cache[f"doi:{doi}"] = count
                         enriched += 1
         except Exception as e:
-            print(f"  DOI batch error: {e}")
+            tprint(f"[Citations] DOI batch error: {e}")
+
         time.sleep(0.15)
 
-        if i > 0 and i % 10_000 == 0:
-            print(f"  DOI {i:,}/{len(doi_list):,} | enriched: {enriched:,}", flush=True)
+        if enriched > 0 and enriched % SAVE_EVERY == 0:
+            with open(CIT_CACHE, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            tprint(f"[Citations] checkpoint {enriched:,} enriched", flush=True)
 
     arxiv_list = list(arxiv_index.keys())
     if test:
@@ -474,63 +521,104 @@ def enrich_citations_openalex(papers: list, test: bool):
                     aid = (ext.get("arxiv") or "").replace("https://arxiv.org/abs/", "").strip()
                     p   = arxiv_index.get(aid)
                     if p:
-                        p["citations"] = w.get("cited_by_count", 0)
+                        count = w.get("cited_by_count", 0)
+                        p["citations"]        = count
+                        cache[f"arxiv:{aid}"] = count
                         enriched += 1
         except Exception as e:
-            print(f"  ArXiv batch error: {e}")
+            tprint(f"[Citations] ArXiv batch error: {e}")
+
         time.sleep(0.15)
 
-        if i > 0 and i % 10_000 == 0:
-            print(f"  ArXiv {i:,}/{len(arxiv_list):,} | enriched: {enriched:,}", flush=True)
+        if enriched > 0 and enriched % SAVE_EVERY == 0:
+            with open(CIT_CACHE, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            tprint(f"[Citations] checkpoint {enriched:,} enriched", flush=True)
+
+    with open(CIT_CACHE, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
 
     total = len(doi_index) + len(arxiv_index)
-    print(f"  Citations enriched: {enriched:,}/{total:,}\n")
+    tprint(f"[Citations] done — {enriched:,}/{total:,} enriched")
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main(test: bool):
-    hf_token              = os.getenv("HF_TOKEN", "")
-    done, oa_done_pairs   = load_progress()
+    hf_token = os.getenv("HF_TOKEN", "")
+    done     = load_progress()
 
-    all_papers, seen_ids = load_fetch_papers()
-    print(f"Loaded {len(all_papers):,} existing papers from {FETCH_FILE}\n")
+    pwc_papers: list = []
+    oa_papers:  list = []
 
-    if not test and "pwc_abstracts" in done:
-        print("[Phase 1] PWC abstracts — skipping (done)\n")
-    else:
-        fetch_pwc(all_papers, seen_ids, hf_token, test)
-        if not test:
-            done.add("pwc_abstracts")
-            save_progress(done, oa_done_pairs)
-        print(f"  Total after PWC: {len(all_papers):,}\n")
+    pwc_skip = not test and "pwc_done" in done
+    oa_skip  = not test and "oa_done"  in done
 
-    if not test and "openalex_papers" in done:
-        print("[Phase 2] OpenAlex papers — skipping (done)\n")
-    else:
-        fetch_openalex(all_papers, seen_ids, oa_done_pairs, test)
-        if not test:
-            done.add("openalex_papers")
-            save_progress(done, oa_done_pairs)
-        print(f"  Total after OpenAlex: {len(all_papers):,}\n")
+    if pwc_skip:
+        print("[Phase 1] PWC — skipping (done)")
+        with open(PWC_FILE, encoding="utf-8") as f:
+            pwc_papers = json.load(f)
+        print(f"  Loaded {len(pwc_papers):,} PWC papers")
 
-    if not test and "github_enriched" in done:
-        print("[Phase 3a] GitHub links — skipping (done)\n")
-    else:
-        enrich_github(all_papers, test)
-        save_fetch_papers(all_papers)
-        if not test:
-            done.add("github_enriched")
-            save_progress(done, oa_done_pairs)
+    if oa_skip:
+        print("[Phase 2] OpenAlex — skipping (done)")
+        with open(OA_FILE, encoding="utf-8") as f:
+            oa_papers = json.load(f)
+        print(f"  Loaded {len(oa_papers):,} OA papers")
 
-    if not test and "citations_enriched" in done:
-        print("[Phase 3b] Citations — skipping (done)\n")
-    else:
-        enrich_citations_openalex(all_papers, test)
-        save_fetch_papers(all_papers)
-        if not test:
-            done.add("citations_enriched")
-            save_progress(done, oa_done_pairs)
+    fetch_needed = (not pwc_skip) or (not oa_skip)
+    if fetch_needed:
+        print("[Phase 1+2] Fetching PWC and OpenAlex in parallel ...")
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {}
+            if not pwc_skip:
+                futures["pwc"] = ex.submit(fetch_pwc, hf_token, test)
+            if not oa_skip:
+                futures["oa"] = ex.submit(fetch_openalex, test)
+
+            if "pwc" in futures:
+                pwc_papers = futures["pwc"].result()
+                if not test:
+                    done.add("pwc_done")
+                    save_progress(done)
+
+            if "oa" in futures:
+                oa_papers = futures["oa"].result()
+                if not test:
+                    done.add("oa_done")
+                    save_progress(done)
+
+    all_papers = merge_papers(pwc_papers, oa_papers)
+
+    github_skip = not test and "github_done" in done
+    cit_skip    = not test and "citations_done" in done
+
+    if github_skip:
+        print("[Phase 3a] GitHub — skipping (done)")
+    if cit_skip:
+        print("[Phase 3b] Citations — skipping (done)")
+
+    enrich_needed = (not github_skip) or (not cit_skip)
+    if enrich_needed:
+        print("[Phase 3a+3b] GitHub and Citations in parallel ...")
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {}
+            if not github_skip:
+                futures["github"] = ex.submit(enrich_github, all_papers, test)
+            if not cit_skip:
+                futures["citations"] = ex.submit(enrich_citations, all_papers, test)
+
+            if "github" in futures:
+                futures["github"].result()
+                if not test:
+                    done.add("github_done")
+                    save_progress(done)
+
+            if "citations" in futures:
+                futures["citations"].result()
+                if not test:
+                    done.add("citations_done")
+                    save_progress(done)
 
     with open(ENRICHED_FILE, "w", encoding="utf-8") as f:
         json.dump(all_papers, f, indent=2, ensure_ascii=False)
