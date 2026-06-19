@@ -1,6 +1,8 @@
 import json
+import sys
 import time
 import requests
+import ijson
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -9,6 +11,7 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / "backend" / ".env")
 
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
 ENRICHED_FILE  = Path("ingestion/papers_enriched.json")
+TMP_FILE       = Path("ingestion/papers_enriched.tmp.json")
 STARS_CACHE    = Path("ingestion/github_stars.json")
 GRAPHQL_URL    = "https://api.github.com/graphql"
 BATCH_SIZE     = 100
@@ -52,15 +55,37 @@ def fetch_stars_batch(repos: list[tuple[str, str, str]]) -> dict[str, int]:
     return {}
 
 
+def apply_cache(stars_cache: dict):
+    print("Applying cached star counts to papers ...")
+    updated = 0
+    total_p = 0
+    with open(ENRICHED_FILE, "rb") as fin, open(TMP_FILE, "w", encoding="utf-8") as fout:
+        fout.write("[")
+        first = True
+        for p in ijson.items(fin, "item"):
+            repos = p.get("github_repos") or []
+            if repos:
+                p["repo_stars"] = [stars_cache.get(url, 0) for url in repos]
+                p["max_stars"]  = max(p["repo_stars"], default=0)
+                updated += 1
+            if not first:
+                fout.write(",\n")
+            fout.write(json.dumps(p, ensure_ascii=False))
+            first = False
+            total_p += 1
+            if total_p % 100_000 == 0:
+                print(f"  {total_p:,} processed | {updated:,} updated", flush=True)
+        fout.write("\n]")
+    TMP_FILE.replace(ENRICHED_FILE)
+    print(f"  Updated {updated:,} papers with repo_stars + max_stars → {ENRICHED_FILE}")
+
+
 def main():
-    if not GITHUB_TOKEN:
+    apply_only = "--cache" in sys.argv
+
+    if not apply_only and not GITHUB_TOKEN:
         print("ERROR: GITHUB_TOKEN not set in .env")
         return
-
-    print(f"Loading {ENRICHED_FILE} ...")
-    with open(ENRICHED_FILE, encoding="utf-8") as f:
-        papers: list = json.load(f)
-    print(f"  {len(papers):,} papers loaded")
 
     stars_cache: dict = {}
     if STARS_CACHE.exists():
@@ -68,18 +93,24 @@ def main():
             stars_cache = json.load(f)
         print(f"  {len(stars_cache):,} star counts already cached")
 
+    if apply_only:
+        apply_cache(stars_cache)
+        return
+
+    # Pass 1: stream to collect unique uncached repo URLs
+    print(f"Pass 1: collecting repo URLs from {ENRICHED_FILE} ...")
     unique_repos: dict[str, tuple[str, str, str]] = {}
-    for p in papers:
-        for url in (p.get("github_repos") or []):
-            if "github.com" not in url:
-                continue
-            if url not in stars_cache:
+    with open(ENRICHED_FILE, "rb") as f:
+        for p in ijson.items(f, "item"):
+            for url in (p.get("github_repos") or []):
+                if "github.com" not in url or url in stars_cache:
+                    continue
                 owner, name = parse_repo(url)
                 if owner and name:
                     unique_repos[url] = (owner, name, url)
-
     print(f"  {len(unique_repos):,} repos to fetch (uncached)\n")
 
+    # Fetch star counts
     repo_list = list(unique_repos.values())
     total     = len(repo_list)
     fetched   = 0
@@ -101,23 +132,29 @@ def main():
         json.dump(stars_cache, f)
     print(f"  Stars fetched: {fetched:,} repos cached\n")
 
-    print("Updating papers with real star counts ...")
+    # Pass 2: stream to apply max_stars and write to tmp file
+    print("Pass 2: applying star counts to papers ...")
     updated = 0
-    for p in papers:
-        repos = p.get("github_repos") or []
-        if not repos:
-            continue
-        max_stars = 0
-        for url in repos:
-            stars = stars_cache.get(url, 0)
-            if stars > max_stars:
-                max_stars = stars
-        p["max_stars"] = max_stars
-        updated += 1
+    total_p = 0
+    with open(ENRICHED_FILE, "rb") as fin, open(TMP_FILE, "w", encoding="utf-8") as fout:
+        fout.write("[")
+        first = True
+        for p in ijson.items(fin, "item"):
+            repos = p.get("github_repos") or []
+            if repos:
+                p["repo_stars"] = [stars_cache.get(url, 0) for url in repos]
+                p["max_stars"]  = max(p["repo_stars"], default=0)
+                updated += 1
+            if not first:
+                fout.write(",\n")
+            fout.write(json.dumps(p, ensure_ascii=False))
+            first = False
+            total_p += 1
+            if total_p % 50_000 == 0:
+                print(f"  {total_p:,} papers processed | {updated:,} updated", flush=True)
+        fout.write("\n]")
 
-    with open(ENRICHED_FILE, "w", encoding="utf-8") as f:
-        json.dump(papers, f, indent=2, ensure_ascii=False)
-
+    TMP_FILE.replace(ENRICHED_FILE)
     print(f"  Updated {updated:,} papers with max_stars")
     print(f"  Saved → {ENRICHED_FILE}")
     print("Done.")
